@@ -307,6 +307,297 @@ class ErrorForceSampler {
 
 ---
 
+## 6. Zipkin Integration
+
+Zipkin เป็นอีก tracing backend ที่นิยม ใช้งานง่ายกว่า Jaeger แต่มี features น้อยกว่า
+
+```bash
+npm install @opentelemetry/exporter-zipkin
+```
+
+```javascript
+// tracing-zipkin.js
+const { NodeSDK } = require('@opentelemetry/sdk-node');
+const { ZipkinExporter } = require('@opentelemetry/exporter-zipkin');
+const { getNodeAutoInstrumentations } = require('@opentelemetry/auto-instrumentations-node');
+const { Resource } = require('@opentelemetry/resources');
+const { SemanticResourceAttributes } = require('@opentelemetry/semantic-conventions');
+
+const exporter = new ZipkinExporter({
+  url: process.env.ZIPKIN_URL || 'http://localhost:9411/api/v2/spans',
+  serviceName: process.env.SERVICE_NAME || 'my-service'
+});
+
+const sdk = new NodeSDK({
+  resource: new Resource({
+    [SemanticResourceAttributes.SERVICE_NAME]: process.env.SERVICE_NAME || 'my-app',
+  }),
+  traceExporter: exporter,
+  instrumentations: [getNodeAutoInstrumentations()]
+});
+
+sdk.start();
+module.exports = sdk;
+```
+
+### Docker Compose กับ Zipkin
+
+```yaml
+# docker-compose.yml
+version: '3.8'
+
+services:
+  zipkin:
+    image: openzipkin/zipkin:latest
+    ports:
+      - "9411:9411"
+    environment:
+      - STORAGE_TYPE=mem
+
+  app:
+    build: .
+    environment:
+      - ZIPKIN_URL=http://zipkin:9411/api/v2/spans
+      - SERVICE_NAME=order-service
+    depends_on:
+      - zipkin
+```
+
+---
+
+## 7. OTLP Exporter (OpenTelemetry Protocol)
+
+OTLP เป็น standard protocol ที่ใช้กับหลาย backends เช่น Grafana Tempo, Honeycomb, Datadog
+
+```bash
+npm install @opentelemetry/exporter-otlp-http
+npm install @opentelemetry/exporter-otlp-grpc
+```
+
+```javascript
+// tracing-otlp.js
+const { OTLPTraceExporter } = require('@opentelemetry/exporter-otlp-http');
+
+const exporter = new OTLPTraceExporter({
+  url: process.env.OTEL_EXPORTER_OTLP_ENDPOINT || 'http://localhost:4318/v1/traces',
+  headers: {
+    'Authorization': `Bearer ${process.env.OTEL_AUTH_TOKEN}`
+  }
+});
+
+const sdk = new NodeSDK({
+  traceExporter: exporter,
+  instrumentations: [getNodeAutoInstrumentations()]
+});
+```
+
+### Grafana Tempo Setup
+
+```yaml
+# docker-compose-tempo.yml
+version: '3.8'
+
+services:
+  tempo:
+    image: grafana/tempo:latest
+    command: ["-config.file=/etc/tempo.yaml"]
+    volumes:
+      - ./tempo.yaml:/etc/tempo.yaml
+    ports:
+      - "3200:3200"   # Tempo UI
+      - "4317:4317"   # OTLP gRPC
+      - "4318:4318"   # OTLP HTTP
+
+  grafana:
+    image: grafana/grafana:latest
+    environment:
+      - GF_AUTH_ANONYMOUS_ENABLED=true
+    ports:
+      - "3001:3000"
+    volumes:
+      - ./grafana/datasources:/etc/grafana/provisioning/datasources
+```
+
+```yaml
+# tempo.yaml
+server:
+  http_listen_port: 3200
+
+distributor:
+  receivers:
+    otlp:
+      protocols:
+        grpc:
+          endpoint: 0.0.0.0:4317
+        http:
+          endpoint: 0.0.0.0:4318
+
+storage:
+  trace:
+    backend: local
+    local:
+      path: /tmp/tempo/blocks
+```
+
+---
+
+## 8. Tracing กับ Database Queries
+
+```javascript
+// manual database tracing
+const { trace, SpanStatusCode } = require('@opentelemetry/api');
+
+async function tracedQuery(queryFn, queryName, params = {}) {
+  const tracer = trace.getTracer('database');
+  
+  return tracer.startActiveSpan(`db.${queryName}`, async (span) => {
+    span.setAttribute('db.system', 'mongodb');
+    span.setAttribute('db.operation', queryName);
+    
+    // เพิ่ม query parameters (sanitized)
+    Object.entries(params).forEach(([key, val]) => {
+      if (typeof val !== 'object') {
+        span.setAttribute(`db.param.${key}`, String(val));
+      }
+    });
+
+    try {
+      const result = await queryFn();
+      
+      if (Array.isArray(result)) {
+        span.setAttribute('db.result_count', result.length);
+      }
+      
+      span.setStatus({ code: SpanStatusCode.OK });
+      return result;
+    } catch (error) {
+      span.recordException(error);
+      span.setStatus({ code: SpanStatusCode.ERROR, message: error.message });
+      throw error;
+    } finally {
+      span.end();
+    }
+  });
+}
+
+// ใช้งาน
+class UserRepository {
+  async findById(id) {
+    return tracedQuery(
+      () => User.findById(id),
+      'findById',
+      { userId: id }
+    );
+  }
+
+  async findMany(filter) {
+    return tracedQuery(
+      () => User.find(filter),
+      'findMany',
+      { filter: JSON.stringify(filter).substring(0, 100) }
+    );
+  }
+}
+```
+
+---
+
+## 9. Correlation IDs
+
+```javascript
+// middleware/correlation.js
+const { v4: uuidv4 } = require('uuid');
+const { context, trace } = require('@opentelemetry/api');
+
+function correlationMiddleware(req, res, next) {
+  // ใช้ trace ID จาก OpenTelemetry หรือสร้าง correlation ID เอง
+  const activeSpan = trace.getActiveSpan();
+  const traceId = activeSpan?.spanContext().traceId || uuidv4().replace(/-/g, '');
+  
+  // รับ correlation ID จาก header (สำหรับ inter-service calls)
+  const correlationId = req.headers['x-correlation-id'] || traceId;
+  
+  req.correlationId = correlationId;
+  res.setHeader('X-Correlation-Id', correlationId);
+  
+  next();
+}
+
+// Logger integration
+const winston = require('winston');
+
+const logger = winston.createLogger({
+  format: winston.format.combine(
+    winston.format.timestamp(),
+    winston.format.printf(({ timestamp, level, message, ...meta }) => {
+      const activeSpan = trace.getActiveSpan();
+      const traceId = activeSpan?.spanContext().traceId || 'no-trace';
+      const spanId = activeSpan?.spanContext().spanId || 'no-span';
+      
+      return JSON.stringify({
+        timestamp,
+        level,
+        message,
+        traceId,
+        spanId,
+        ...meta
+      });
+    })
+  ),
+  transports: [new winston.transports.Console()]
+});
+
+module.exports = { correlationMiddleware, logger };
+```
+
+---
+
+## 10. Trace-based Alerting
+
+```javascript
+// monitoring/trace-alerts.js
+// ตั้งค่า alerts จาก trace data ใน Grafana
+
+/*
+Grafana Query สำหรับ slow traces:
+{
+  "target": "histogram_quantile(0.99, sum(rate(traces_spanmetrics_duration_milliseconds_bucket[5m])) by (le, service_name, span_name))",
+  "refId": "A"
+}
+
+Alert Rule:
+- Expression: A > 2000 (2 seconds)
+- For: 5 minutes
+- Labels: severity=warning
+*/
+
+// Code-level trace assertions (สำหรับ testing)
+async function assertTracePerformance(fn, maxDurationMs) {
+  const start = Date.now();
+  const result = await fn();
+  const duration = Date.now() - start;
+  
+  if (duration > maxDurationMs) {
+    const activeSpan = trace.getActiveSpan();
+    activeSpan?.setAttribute('performance.violation', true);
+    activeSpan?.setAttribute('performance.expected_ms', maxDurationMs);
+    activeSpan?.setAttribute('performance.actual_ms', duration);
+    
+    console.warn(`Performance violation: expected < ${maxDurationMs}ms, got ${duration}ms`);
+  }
+  
+  return result;
+}
+
+// ใช้งาน
+const result = await assertTracePerformance(
+  () => expensiveOperation(),
+  500 // expect under 500ms
+);
+```
+
+---
+
 ## แบบฝึกหัด
 
 ### ระดับ 1: พื้นฐาน
